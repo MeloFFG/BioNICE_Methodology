@@ -1,0 +1,13 @@
+# scikit-learn/joblib/scipy/numpy/pandas are pinned to the exact versions
+# used to train and pickle models/model2_ai_integration.joblib (verified via
+# `python3 -c "import sklearn; print(sklearn.__version__)"` etc. in the
+# training environment). A different scikit-learn version can unpickle the
+# model differently or fail outright - do not loosen these pins casually.
+scikit-learn==1.9.0
+joblib==1.5.3
+scipy==1.18.0
+numpy==2.4.6
+pandas==3.0.3
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0

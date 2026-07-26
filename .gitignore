@@ -22,6 +22,10 @@ outputs/
 *.pkl
 *.pickle
 *.joblib
+# Exception: the trained model artifact the deployed backend/app.py loads at
+# startup must actually be committed, or Render's git-based deploy will have
+# no model file to load.
+!backend/model2_ai_integration.joblib
 
 # Logs and temporary files
 *.log

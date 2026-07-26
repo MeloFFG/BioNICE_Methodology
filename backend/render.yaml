@@ -1,0 +1,21 @@
+# Render Blueprint for the Bio-NICE AI-integration prediction API.
+# Deploy flow: push this repo to GitHub, then in the Render Dashboard use
+# "New +" -> "Blueprint" and point it at the repo/branch. Render reads this
+# file and creates the service below.
+services:
+  - type: web
+    name: bionice-ai-integration-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      # Pinned to match the exact Python version used to train/pickle the
+      # model locally (verified via `python3 --version`); Render's current
+      # default for new services is also 3.14.x as of Feb 2026, so this
+      # should already match without pinning, but pin explicitly anyway so
+      # a future Render default change can't silently break unpickling.
+      - key: PYTHON_VERSION
+        value: 3.14.0
