@@ -6,7 +6,9 @@ Goal:
     Core / Adjacent / Company-context only / Exclude
 
 Model:
-    TF-IDF + Logistic Regression
+    TF-IDF + Logistic Regression, evaluated with stratified k-fold CV
+    (mirrors train_ai_integration_model.py's approach/bundle format so
+    backend/app.py can load and use both models the same way).
 
 Expected input:
     data/processed/linkedin_v2_ai_labeled_broad_biotech_pool_agent_loop_cleaned_v1.csv
@@ -14,9 +16,10 @@ Expected input:
 Main outputs:
     outputs/model1_relevance_classification_report.csv
     outputs/model1_relevance_confusion_matrix.csv
+    outputs/model1_relevance_cv_results.csv
     outputs/model1_relevance_predictions.csv
     outputs/model1_relevance_top_terms_by_class.csv
-    models/model1_relevance_tfidf_logreg.joblib
+    models/model1_relevance.joblib
 """
 
 from pathlib import Path
@@ -29,10 +32,8 @@ import pandas as pd
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import StratifiedKFold
 
 warnings.filterwarnings("ignore")
 
@@ -76,9 +77,13 @@ def load_data(input_path: str, high_confidence_only: bool = True) -> pd.DataFram
     """Load dataset and optionally keep only rows that do not need human review."""
     df = pd.read_csv(input_path)
 
-    missing_cols = [col for col in [TARGET_COLUMN, *TEXT_COLUMNS] if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+    # Only the target column is strictly required. TEXT_COLUMNS are best-effort:
+    # build_model_text() below uses whichever of them actually exist. On the
+    # current dataset only title_for_agent/description_for_agent exist - the
+    # other 4 were never populated (verified against the actual CSV header),
+    # so requiring all of TEXT_COLUMNS here would hard-crash on real data.
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Missing required column: {TARGET_COLUMN}")
 
     df = df.copy()
 
@@ -113,11 +118,9 @@ def build_model_text(df: pd.DataFrame) -> pd.Series:
     return text
 
 
-def get_top_terms_by_class(pipe: Pipeline, top_n: int = 30) -> pd.DataFrame:
+def get_top_terms_by_class(vectorizer: TfidfVectorizer, clf: LogisticRegression,
+                            top_n: int = 40) -> pd.DataFrame:
     """Extract top positive TF-IDF terms for each Logistic Regression class."""
-    vectorizer = pipe.named_steps["tfidf"]
-    clf = pipe.named_steps["clf"]
-
     feature_names = np.array(vectorizer.get_feature_names_out())
     rows = []
 
@@ -136,10 +139,18 @@ def get_top_terms_by_class(pipe: Pipeline, top_n: int = 30) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def get_model(random_state: int = 42) -> LogisticRegression:
+    # logreg only: gbt/rf are tree-based and repeatedly got killed by this
+    # environment's resource limits when training Model 2 at this same
+    # dataset scale (see src/train_ai_integration_model.py history).
+    return LogisticRegression(max_iter=3000, class_weight="balanced",
+                              solver="saga", n_jobs=-1, random_state=random_state)
+
+
 def train_relevance_model(
     input_path: str,
     high_confidence_only: bool = True,
-    test_size: float = 0.2,
+    n_folds: int = 5,
     random_state: int = 42,
 ) -> None:
     make_dirs()
@@ -147,7 +158,7 @@ def train_relevance_model(
     df = load_data(input_path, high_confidence_only=high_confidence_only)
     df["model_text"] = build_model_text(df)
 
-    X = df["model_text"]
+    X_text = df["model_text"]
     y = df[TARGET_COLUMN]
 
     print("\n=== Dataset summary ===")
@@ -156,92 +167,101 @@ def train_relevance_model(
     print("\nLabel distribution:")
     print(y.value_counts())
 
-    X_train, X_test, y_train, y_test, train_idx, test_idx = train_test_split(
-        X,
-        y,
-        df.index,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
+    tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=30000, min_df=2,
+                            max_df=0.90, sublinear_tf=True, stop_words="english")
+    X = tfidf.fit_transform(X_text)
 
-    pipe = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            ngram_range=(1, 2),
-            max_features=30000,
-            min_df=2,
-            max_df=0.90,
-            sublinear_tf=True,
-            stop_words="english",
-        )),
-        ("clf", LogisticRegression(
-            max_iter=3000,
-            class_weight="balanced",
-            solver="saga",
-            multi_class="multinomial",
-            n_jobs=-1,
-            random_state=random_state,
-        )),
-    ])
+    class_counts = y.value_counts()
+    min_class_count = int(class_counts.min())
+    effective_folds = min(n_folds, min_class_count)
 
-    print("\nTraining model...")
-    pipe.fit(X_train, y_train)
+    y_pred_all = np.full(len(y), fill_value=None, dtype=object)
+    cv_df = pd.DataFrame(columns=["fold", "f1_macro", "f1_weighted", "n_train", "n_test"])
 
-    y_pred = pipe.predict(X_test)
-    y_proba = pipe.predict_proba(X_test)
+    if effective_folds < 2:
+        print(f"\nSkipping cross-validation: smallest class ({class_counts.idxmin()}) "
+              f"has only {min_class_count} example(s), fewer than the 2 needed for CV. "
+              f"Training the final model on all {len(y)} rows without CV metrics.")
+    else:
+        if effective_folds < n_folds:
+            print(f"\nReducing folds from {n_folds} to {effective_folds}: smallest class "
+                  f"({class_counts.idxmin()}) has only {min_class_count} example(s).")
+        cv = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=random_state)
+        print(f"\nRunning {effective_folds}-fold stratified cross-validation...")
+        fold_results = []
 
-    # -----------------------------
-    # Evaluation outputs
-    # -----------------------------
-    report = classification_report(
-        y_test,
-        y_pred,
-        labels=LABEL_ORDER,
-        output_dict=True,
-        zero_division=0,
-    )
+        for fold_i, (train_idx, test_idx) in enumerate(cv.split(X, y), start=1):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            clf = get_model(random_state=random_state)
+            clf.fit(X_train, y_train)
+            y_pred_fold = clf.predict(X_test)
+            y_pred_all[test_idx] = y_pred_fold
+            f1_macro = f1_score(y_test, y_pred_fold, labels=LABEL_ORDER,
+                                average="macro", zero_division=0)
+            f1_weighted = f1_score(y_test, y_pred_fold, labels=LABEL_ORDER,
+                                   average="weighted", zero_division=0)
+            fold_results.append({"fold": fold_i, "f1_macro": f1_macro,
+                                  "f1_weighted": f1_weighted,
+                                  "n_train": len(train_idx), "n_test": len(test_idx)})
+            print(f"  Fold {fold_i}: F1-macro={f1_macro:.3f}  F1-weighted={f1_weighted:.3f}")
 
-    report_df = pd.DataFrame(report).transpose()
-    report_path = "outputs/model1_relevance_classification_report.csv"
-    report_df.to_csv(report_path)
+        cv_df = pd.DataFrame(fold_results)
+        cv_df.loc[len(cv_df)] = {"fold": "mean", "f1_macro": cv_df["f1_macro"].mean(),
+                                  "f1_weighted": cv_df["f1_weighted"].mean(),
+                                  "n_train": "", "n_test": ""}
+    cv_df.to_csv("outputs/model1_relevance_cv_results.csv", index=False)
 
-    cm = confusion_matrix(y_test, y_pred, labels=LABEL_ORDER)
-    cm_df = pd.DataFrame(cm, index=LABEL_ORDER, columns=LABEL_ORDER)
-    cm_path = "outputs/model1_relevance_confusion_matrix.csv"
-    cm_df.to_csv(cm_path)
+    have_cv_preds = pd.notna(y_pred_all).all()
+    if have_cv_preds:
+        report = classification_report(y, y_pred_all, labels=LABEL_ORDER,
+                                       output_dict=True, zero_division=0)
+        pd.DataFrame(report).transpose().to_csv(
+            "outputs/model1_relevance_classification_report.csv")
 
-    # Save prediction-level file for error analysis.
-    pred_df = df.loc[test_idx].copy()
-    pred_df["true_label"] = y_test.values
-    pred_df["pred_label"] = y_pred
+        cm = confusion_matrix(y, y_pred_all, labels=LABEL_ORDER)
+        cm_df = pd.DataFrame(cm, index=LABEL_ORDER, columns=LABEL_ORDER)
+        cm_df.to_csv("outputs/model1_relevance_confusion_matrix.csv")
+    else:
+        cm_df = pd.DataFrame()
 
-    for i, class_name in enumerate(pipe.named_steps["clf"].classes_):
-        pred_df[f"prob_{class_name}"] = y_proba[:, i]
+    pred_df = df.copy()
+    pred_df["predicted_label"] = y_pred_all
+    pred_df["true_label"] = y.values
+    pred_cols = ["job_id", "title_for_agent", TARGET_COLUMN,
+                 "true_label", "predicted_label"]
+    pred_cols = [c for c in pred_cols if c in pred_df.columns]
+    pred_df[pred_cols].to_csv("outputs/model1_relevance_predictions.csv", index=False)
 
-    pred_path = "outputs/model1_relevance_predictions.csv"
-    pred_df.to_csv(pred_path, index=False)
+    print("\nTraining final model on all data...")
+    final_clf = get_model(random_state=random_state)
+    final_clf.fit(X, y)
 
-    # Top terms by class.
-    top_terms_df = get_top_terms_by_class(pipe, top_n=40)
-    top_terms_path = "outputs/model1_relevance_top_terms_by_class.csv"
-    top_terms_df.to_csv(top_terms_path, index=False)
+    top_terms_df = get_top_terms_by_class(tfidf, final_clf, top_n=40)
+    top_terms_df.to_csv("outputs/model1_relevance_top_terms_by_class.csv", index=False)
 
-    # Save model.
-    model_path = "models/model1_relevance_tfidf_logreg.joblib"
-    joblib.dump(pipe, model_path)
+    joblib.dump({"vectorizer": tfidf, "classifier": final_clf},
+                "models/model1_relevance.joblib")
 
-    print("\n=== Classification report ===")
-    print(classification_report(y_test, y_pred, labels=LABEL_ORDER, zero_division=0))
-
-    print("\n=== Confusion matrix ===")
-    print(cm_df)
+    if have_cv_preds:
+        print(f"\n=== Classification Report ({effective_folds}-fold CV) ===")
+        print(classification_report(y, y_pred_all, labels=LABEL_ORDER, zero_division=0))
+        print("=== Confusion Matrix ===")
+        print(cm_df)
+        print(f"\nMean F1-macro: {cv_df.iloc[-1]['f1_macro']:.3f}")
+        print(f"Mean F1-weighted: {cv_df.iloc[-1]['f1_weighted']:.3f}")
+    else:
+        print("\nNo CV metrics available (see skip message above). "
+              "Final model was still trained and saved on all available rows.")
 
     print("\nSaved files:")
-    print(f"- {report_path}")
-    print(f"- {cm_path}")
-    print(f"- {pred_path}")
-    print(f"- {top_terms_path}")
-    print(f"- {model_path}")
+    print("- outputs/model1_relevance_cv_results.csv")
+    if have_cv_preds:
+        print("- outputs/model1_relevance_classification_report.csv")
+        print("- outputs/model1_relevance_confusion_matrix.csv")
+    print("- outputs/model1_relevance_predictions.csv")
+    print("- outputs/model1_relevance_top_terms_by_class.csv")
+    print("- models/model1_relevance.joblib")
 
 
 def main():
@@ -257,17 +277,17 @@ def main():
         help="Use all rows, including rows marked as needing human review.",
     )
     parser.add_argument(
-        "--test_size",
-        type=float,
-        default=0.2,
-        help="Test split fraction.",
+        "--folds",
+        type=int,
+        default=5,
+        help="Number of stratified CV folds (auto-reduced if a class is smaller).",
     )
     args = parser.parse_args()
 
     train_relevance_model(
         input_path=args.input,
         high_confidence_only=not args.all_rows,
-        test_size=args.test_size,
+        n_folds=args.folds,
     )
 
 
