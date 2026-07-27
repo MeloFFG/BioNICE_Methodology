@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bio-NICE AI Integration Predictor</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 640px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #1a1a1a;
+  }
+  h1 { font-size: 1.4rem; }
+  label { display: block; font-weight: 600; margin-top: 16px; margin-bottom: 4px; }
+  input[type="text"], textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+  }
+  textarea { min-height: 160px; resize: vertical; }
+  button {
+    margin-top: 16px;
+    padding: 10px 20px;
+    font-size: 1rem;
+    background: #1a1a1a;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:disabled { background: #999; cursor: not-allowed; }
+  #result {
+    margin-top: 24px;
+    padding: 16px;
+    border-radius: 6px;
+    border: 1px solid #ddd;
+    display: none;
+  }
+  #result.visible { display: block; }
+  #result.error { border-color: #c0392b; background: #fdecea; }
+  .prediction-label { font-size: 1.2rem; font-weight: 700; }
+  .prob-row { display: flex; justify-content: space-between; font-size: 0.9rem; margin-top: 4px; }
+  .note { color: #666; font-size: 0.85rem; margin-top: 24px; }
+</style>
+</head>
+<body>
+
+<h1>Bio-NICE AI Integration Predictor</h1>
+<p>Paste a job title and description to predict its AI/data-integration level (None / Low / Moderate).</p>
+
+<label for="title">Job title</label>
+<input type="text" id="title" placeholder="e.g. Senior Data Scientist, Bioinformatics">
+
+<label for="description">Job description</label>
+<textarea id="description" placeholder="Paste the full posting text here..."></textarea>
+
+<button id="submitBtn" onclick="submitPrediction()">Predict</button>
+
+<div id="result"></div>
+
+<p class="note">
+  Note: this model was trained with zero "High" examples, so it can only
+  ever return None, Low, or Moderate - never High.
+</p>
+
+<script>
+  // A plain static page like this has no build step, so there's no real
+  // environment-variable injection available at runtime; editing this
+  // constant (or overriding via ?api=... below) is the actual mechanism.
+  const DEFAULT_API_URL = "https://bionice-ai-integration-api.onrender.com/predict";
+
+  function getApiUrl() {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("api") || DEFAULT_API_URL;
+  }
+
+  async function submitPrediction() {
+    const title = document.getElementById("title").value;
+    const description = document.getElementById("description").value;
+    const resultEl = document.getElementById("result");
+    const btn = document.getElementById("submitBtn");
+    const apiUrl = getApiUrl();
+
+    btn.disabled = true;
+    btn.textContent = "Predicting...";
+    resultEl.className = "visible";
+    resultEl.innerHTML = "Loading...";
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, description }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`API returned ${response.status}: ${text}`);
+      }
+
+      const data = await response.json();
+      renderResult(data);
+    } catch (err) {
+      resultEl.className = "visible error";
+      resultEl.innerHTML = `<strong>Request failed:</strong> ${escapeHtml(err.message)}` +
+        `<br><br>API URL used: <code>${escapeHtml(apiUrl)}</code>` +
+        `<br>If this is still the placeholder URL, replace DEFAULT_API_URL in index.html ` +
+        `with your real Render URL, or add <code>?api=https://your-api.onrender.com/predict</code> ` +
+        `to this page's URL.`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Predict";
+    }
+  }
+
+  function renderResult(data) {
+    const resultEl = document.getElementById("result");
+    resultEl.className = "visible";
+
+    let html = `<div class="prediction-label">Prediction: ${escapeHtml(data.prediction)}</div>`;
+
+    if (data.probabilities) {
+      html += "<div style='margin-top:12px;'>";
+      const entries = Object.entries(data.probabilities).sort((a, b) => b[1] - a[1]);
+      for (const [label, prob] of entries) {
+        html += `<div class="prob-row"><span>${escapeHtml(label)}</span><span>${(prob * 100).toFixed(1)}%</span></div>`;
+      }
+      html += "</div>";
+    }
+
+    resultEl.innerHTML = html;
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+  }
+</script>
+
+</body>
+</html>
