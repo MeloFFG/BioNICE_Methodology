@@ -44,7 +44,9 @@
   }
   #result.visible { display: block; }
   #result.error { border-color: #c0392b; background: #fdecea; }
+  #result.rejected { border-color: #b8860b; background: #fdf6e3; }
   .prediction-label { font-size: 1.2rem; font-weight: 700; }
+  .relevance-sub { font-size: 0.85rem; color: #666; margin-top: 2px; }
   .prob-row { display: flex; justify-content: space-between; font-size: 0.9rem; margin-top: 4px; }
   .note { color: #666; font-size: 0.85rem; margin-top: 24px; }
 </style>
@@ -52,7 +54,9 @@
 <body>
 
 <h1>Bio-NICE AI Integration Predictor</h1>
-<p>Paste a job title and description to predict its AI/data-integration level (None / Low / Moderate).</p>
+<p>Paste a job title and description to predict its AI/data-integration level (None / Low / Moderate).
+Off-domain or nonsense input (e.g. "soccer player") is caught by a relevance
+gate first and rejected before reaching the AI-integration model.</p>
 
 <label for="title">Job title</label>
 <input type="text" id="title" placeholder="e.g. Senior Data Scientist, Bioinformatics">
@@ -121,20 +125,34 @@
 
   function renderResult(data) {
     const resultEl = document.getElementById("result");
-    resultEl.className = "visible";
 
-    let html = `<div class="prediction-label">Prediction: ${escapeHtml(data.prediction)}</div>`;
-
-    if (data.probabilities) {
-      html += "<div style='margin-top:12px;'>";
-      const entries = Object.entries(data.probabilities).sort((a, b) => b[1] - a[1]);
-      for (const [label, prob] of entries) {
-        html += `<div class="prob-row"><span>${escapeHtml(label)}</span><span>${(prob * 100).toFixed(1)}%</span></div>`;
-      }
-      html += "</div>";
+    if (!data.relevant) {
+      resultEl.className = "visible rejected";
+      let html = `<div class="prediction-label">Rejected: not Bio-NICE-relevant</div>`;
+      html += `<div style="margin-top:8px;">${escapeHtml(data.message || "")}</div>`;
+      html += renderProbabilities(data.relevance_probabilities, "Relevance model breakdown");
+      resultEl.innerHTML = html;
+      return;
     }
 
+    resultEl.className = "visible";
+    let html = `<div class="prediction-label">Prediction: ${escapeHtml(data.prediction)}</div>`;
+    html += `<div class="relevance-sub">Relevance: ${escapeHtml(data.relevance_prediction)}</div>`;
+    html += renderProbabilities(data.probabilities, "AI-integration breakdown");
+    html += renderProbabilities(data.relevance_probabilities, "Relevance model breakdown");
+
     resultEl.innerHTML = html;
+  }
+
+  function renderProbabilities(probabilities, heading) {
+    if (!probabilities) return "";
+    let html = `<div style="margin-top:12px;"><strong style="font-size:0.85rem;">${escapeHtml(heading)}</strong>`;
+    const entries = Object.entries(probabilities).sort((a, b) => b[1] - a[1]);
+    for (const [label, prob] of entries) {
+      html += `<div class="prob-row"><span>${escapeHtml(label)}</span><span>${(prob * 100).toFixed(1)}%</span></div>`;
+    }
+    html += "</div>";
+    return html;
   }
 
   function escapeHtml(str) {
